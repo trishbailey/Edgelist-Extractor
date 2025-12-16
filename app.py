@@ -68,34 +68,54 @@ def promote_meltwater_header(df: pd.DataFrame) -> pd.DataFrame:
     return df_clean
 
 
+# ============================
+# BEGIN FIX: Meltwater loading
+# ============================
+
 def load_and_clean_meltwater_file(file_like) -> pd.DataFrame:
     """
-    Read a single Meltwater CSV uploaded to Streamlit,
-    using robust settings (latin1, python engine, no assumed header),
-    then fix the header row.
+    Read a single Meltwater CSV uploaded to Streamlit.
+
+    Assumes:
+      - Row 0 is a junk/query line
+      - Row 1 is the real header row (Date, Time, Document ID, URL, ...)
+
+    So we:
+      - Use header=1 (second row as header)
+      - Use latin1 + python engine for robustness
     """
-    raw = pd.read_csv(
+    df = pd.read_csv(
         file_like,
         encoding="latin1",
         engine="python",
         on_bad_lines="warn",   # or "skip" if you want to silently drop bad lines
-        header=None,           # don't treat first row as header
+        header=1,              # <-- IMPORTANT: treat second row as header
     )
-    df_clean = promote_meltwater_header(raw)
-    return df_clean
+
+    # Clean up column names a bit (strip spaces, make them consistent)
+    df.columns = df.columns.astype(str).str.strip()
+
+    return df
 
 
 def load_and_combine_meltwater_streamlit(uploaded_files) -> pd.DataFrame:
     """
     Load multiple Meltwater CSV files from Streamlit's uploader,
-    clean each, then concatenate into a single combined DataFrame.
+    clean each with the Meltwater-specific loader above,
+    then concatenate into a single combined DataFrame.
     """
     dfs = []
     for f in uploaded_files:
         df_clean = load_and_clean_meltwater_file(f)
         dfs.append(df_clean)
+
     combined = pd.concat(dfs, ignore_index=True)
     return combined
+
+# ==========================
+# END FIX: Meltwater loading
+# ==========================
+
 
 
 # -----------------------------
