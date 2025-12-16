@@ -11,7 +11,6 @@ import streamlit as st
 # -----------------------------
 
 WORKING_COLUMNS = [
-    # For edges
     "Date",
     "Time",
     "Author Handle",
@@ -19,9 +18,8 @@ WORKING_COLUMNS = [
     "Hit Sentence",
     "Links",
     "Source Domain",
-    # For node enrichment
     "Language",
-    "Country",          # optional; will be ignored if missing
+    "Country",
     "Engagement",
     "Reach",
     "Estimated Views",
@@ -30,29 +28,20 @@ WORKING_COLUMNS = [
     "Document Tags",
 ]
 
+# Columns we need to build edges
+REQUIRED_EDGE_COLUMNS = {"Author Handle"}
+TEXT_EDGE_COLUMNS = {"Opening Text", "Hit Sentence"}
+LINK_EDGE_COLUMNS = {"Links"}
+
 HANDLE_REGEX = r"(@[A-Za-z0-9_]+)"
 X_DOMAINS = {"x.com", "twitter.com", "mobile.twitter.com"}
 
 
 # -----------------------------
-# UTILITIES: LOADING MELTWATER EXPORTS (ROBUST)
+# UTILITIES: LOADING MELTWATER EXPORTS (ROBUST + HEADER DETECTION)
 # -----------------------------
 
-def load_and_clean_meltwater_file(file_like) -> pd.DataFrame:
-    """
-    Robust reader for Meltwater exports that often contain:
-      - inconsistent field counts
-      - broken/unbalanced quotes
-      - mixed delimiters (TSV is common)
-      - a junk first line before the real header
-
-    Strategy:
-      1) Read raw bytes/text and drop first line (junk/query line)
-      2) Try TSV with QUOTE_NONE (treat quotes as literal)
-      3) Fallback to comma CSV with same settings
-      4) Force strings; never let pandas infer types
-      5) Skip malformed rows deterministically
-    """
+def _decode_uploaded_file(file_like) -> str:
     try:
         file_like.seek(0)
     except Exception:
@@ -60,19 +49,58 @@ def load_and_clean_meltwater_file(file_like) -> pd.DataFrame:
 
     raw = file_like.read()
     if isinstance(raw, bytes):
-        text = raw.decode("latin1", errors="replace")
-    else:
-        text = str(raw)
+        return raw.decode("latin1", errors="replace")
+    return str(raw)
 
-    # Drop the first line (Meltwater often includes a query/junk line)
+
+def _find_header_line_index(lines) -> int | None:
+    """
+    Find the line index that looks like the real Meltwater header.
+    We look for a line containing several expected column names.
+    """
+    # Be tolerant: check lowercase, and allow either comma or tab separated header lines.
+    header_markers = [
+        "date",
+        "time",
+        "author handle",
+    ]
+    # Search first ~50 lines (more than enough for Meltwater preamble)
+    max_scan = min(len(lines), 80)
+    for i in range(max_scan):
+        hay = lines[i].strip().lower()
+        if not hay:
+            continue
+        # Must contain all core markers
+        if all(m in hay for m in header_markers):
+            return i
+    return None
+
+
+def load_and_clean_meltwater_file(file_like) -> pd.DataFrame:
+    """
+    Robust reader that:
+      1) decodes raw text
+      2) finds the true header row by scanning for 'Date', 'Time', 'Author Handle'
+      3) reads from that header row onward
+      4) tries TSV first, then CSV
+      5) treats quotes literally and skips malformed lines
+    """
+    text = _decode_uploaded_file(file_like)
     lines = text.splitlines()
-    if len(lines) >= 2:
-        text = "\n".join(lines[1:])
+
+    header_idx = _find_header_line_index(lines)
+    if header_idx is None:
+        # Could not find a header line; return empty with a helpful signal
+        return pd.DataFrame()
+
+    # Rebuild text starting at the header row
+    trimmed_text = "\n".join(lines[header_idx:])
 
     def _read_with_sep(sep: str) -> pd.DataFrame:
         return pd.read_csv(
-            StringIO(text),
+            StringIO(trimmed_text),
             sep=sep,
+            header=0,
             engine="python",
             dtype=str,
             keep_default_na=False,
@@ -80,25 +108,21 @@ def load_and_clean_meltwater_file(file_like) -> pd.DataFrame:
             quoting=csv.QUOTE_NONE,
         )
 
-    # Try TSV first, then comma CSV
+    # Try TSV then CSV
     try:
         df = _read_with_sep("\t")
-        # If it parsed into a single column, delimiter likely wasn't tab
+        # If it parsed as 1 column, delimiter probably isn't tab
         if df.shape[1] <= 1:
             df = _read_with_sep(",")
     except Exception:
         df = _read_with_sep(",")
 
+    # Clean column names
     df.columns = df.columns.astype(str).str.strip()
     return df
 
 
 def load_and_combine_meltwater_streamlit(uploaded_files) -> pd.DataFrame:
-    """
-    Load multiple Meltwater files from Streamlit's uploader,
-    clean each with the robust loader above,
-    then concatenate into a single combined DataFrame.
-    """
     dfs = []
     for f in uploaded_files:
         df_clean = load_and_clean_meltwater_file(f)
@@ -116,24 +140,12 @@ def load_and_combine_meltwater_streamlit(uploaded_files) -> pd.DataFrame:
 # -----------------------------
 
 def normalize_author_handle(series: pd.Series) -> pd.Series:
-    """
-    Normalize author handles:
-      - force string
-      - strip whitespace
-      - ensure leading '@' if non-empty and missing
-    """
     s = series.fillna("").astype(str).str.strip()
     s = s.apply(lambda x: x if (x == "" or x.startswith("@")) else f"@{x}")
     return s
 
 
 def get_working_table(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Reduce a raw Meltwater table to the working schema:
-      - keep only columns that exist from WORKING_COLUMNS
-      - normalize Author Handle and Source Domain
-      - ensure text columns are non-null strings
-    """
     if df is None or df.empty:
         return pd.DataFrame()
 
@@ -168,12 +180,6 @@ def get_working_table(df: pd.DataFrame) -> pd.DataFrame:
 # -----------------------------
 
 def extract_handles_from_text(series: pd.Series) -> pd.DataFrame:
-    """
-    Given a Series of text, return a DataFrame with:
-      - row_index: original row index
-      - handle: extracted handle (@something)
-    Uses vectorized extractall for performance.
-    """
     text = series.fillna("").astype(str)
     extracted = text.str.extractall(HANDLE_REGEX)
     if extracted.empty:
@@ -185,12 +191,6 @@ def extract_handles_from_text(series: pd.Series) -> pd.DataFrame:
 
 
 def build_text_mention_edges(working: pd.DataFrame) -> pd.DataFrame:
-    """
-    Build edges from text mentions:
-      source = Author Handle
-      target = @handle found in Opening Text or Hit Sentence
-      edge_type = 'text_mention'
-    """
     if "Author Handle" not in working.columns:
         return pd.DataFrame(columns=["source", "target", "edge_type"])
 
@@ -210,12 +210,11 @@ def build_text_mention_edges(working: pd.DataFrame) -> pd.DataFrame:
     extracted["source"] = extracted["source"].fillna("").astype(str).str.strip()
     extracted["target"] = extracted["target"].fillna("").astype(str).str.strip()
 
-    # Drop self-loops and empty endpoints
     mask_valid = (extracted["source"] != "") & (extracted["target"] != "")
     mask_not_self = extracted["source"].str.lower() != extracted["target"].str.lower()
+
     edges = extracted.loc[mask_valid & mask_not_self, ["source", "target"]].copy()
     edges["edge_type"] = "text_mention"
-
     return edges.drop_duplicates().reset_index(drop=True)
 
 
@@ -224,11 +223,6 @@ def build_text_mention_edges(working: pd.DataFrame) -> pd.DataFrame:
 # -----------------------------
 
 def parse_links_cell(links_value) -> set:
-    """
-    Given the raw 'Links' cell from Meltwater, return a set of targets:
-      - @username for X/Twitter URLs
-      - domain.com for all other URLs
-    """
     targets = set()
     if pd.isna(links_value):
         return targets
@@ -237,12 +231,10 @@ def parse_links_cell(links_value) -> set:
     if not text:
         return targets
 
-    # crude split on whitespace / commas / semicolons
     parts = re.split(r"[\s,;]+", text)
     parts = [p for p in parts if p]
 
     for url in parts:
-        # If scheme missing, urlparse treats it as path and netloc becomes empty
         if not re.match(r"^https?://", url, flags=re.I):
             url = "https://" + url
 
@@ -255,12 +247,11 @@ def parse_links_cell(links_value) -> set:
             domain = domain[4:]
 
         path = (parsed.path or "").strip("/")
+
         if domain in X_DOMAINS:
-            # X account is first path segment (ignore 'intent', 'share', etc.)
             segments = [s for s in path.split("/") if s]
             if segments:
                 username = segments[0]
-                # Skip obvious non-user paths
                 if username.lower() not in {"intent", "share", "home", "i"}:
                     targets.add("@" + username)
         else:
@@ -270,12 +261,6 @@ def parse_links_cell(links_value) -> set:
 
 
 def build_link_edges(working: pd.DataFrame) -> pd.DataFrame:
-    """
-    Build edges from Links:
-      source = Author Handle
-      target = @username (for X) or domain.com (for other URLs)
-      edge_type = 'x_link' or 'domain_link'
-    """
     if "Author Handle" not in working.columns or "Links" not in working.columns:
         return pd.DataFrame(columns=["source", "target", "edge_type"])
 
@@ -294,8 +279,7 @@ def build_link_edges(working: pd.DataFrame) -> pd.DataFrame:
     if not rows:
         return pd.DataFrame(columns=["source", "target", "edge_type"])
 
-    edges = pd.DataFrame(rows)
-    return edges.drop_duplicates().reset_index(drop=True)
+    return pd.DataFrame(rows).drop_duplicates().reset_index(drop=True)
 
 
 # -----------------------------
@@ -303,13 +287,6 @@ def build_link_edges(working: pd.DataFrame) -> pd.DataFrame:
 # -----------------------------
 
 def build_edge_list(working: pd.DataFrame) -> pd.DataFrame:
-    """
-    Build the full directed edge list from the working table.
-    Combines:
-      - text mentions
-      - link-derived edges
-    Aggregates to compute weights.
-    """
     text_edges = build_text_mention_edges(working)
     link_edges = build_link_edges(working)
 
@@ -326,13 +303,10 @@ def build_edge_list(working: pd.DataFrame) -> pd.DataFrame:
 
 
 # -----------------------------
-# NODE TABLE (SHARED HANDLE + DOMAIN SET)
+# NODE TABLE
 # -----------------------------
 
 def aggregate_author_stats(working: pd.DataFrame) -> pd.DataFrame:
-    """
-    Aggregate stats for author handles from the working table.
-    """
     if "Author Handle" not in working.columns:
         return pd.DataFrame(columns=[
             "id", "num_posts", "total_engagement", "total_reach",
@@ -368,18 +342,11 @@ def aggregate_author_stats(working: pd.DataFrame) -> pd.DataFrame:
         if "Country" in df.columns else pd.Series(dtype="object")
     )
 
-    stats = pd.concat(
-        [num_posts, total_eng, total_reach, est_views, language, country],
-        axis=1
-    ).reset_index()
-
+    stats = pd.concat([num_posts, total_eng, total_reach, est_views, language, country], axis=1).reset_index()
     return stats.rename(columns={"Author Handle": "id"})
 
 
 def aggregate_domain_stats(working: pd.DataFrame) -> pd.DataFrame:
-    """
-    Aggregate stats for domains using the Source Domain column.
-    """
     if "Source Domain" not in working.columns:
         return pd.DataFrame(columns=[
             "id", "num_posts", "total_engagement", "total_reach",
@@ -416,22 +383,11 @@ def aggregate_domain_stats(working: pd.DataFrame) -> pd.DataFrame:
         if "Country" in df.columns else pd.Series(dtype="object")
     )
 
-    stats = pd.concat(
-        [num_posts, total_eng, total_reach, est_views, language, country],
-        axis=1
-    ).reset_index()
-
+    stats = pd.concat([num_posts, total_eng, total_reach, est_views, language, country], axis=1).reset_index()
     return stats.rename(columns={"Source Domain": "id"})
 
 
 def build_node_table(working: pd.DataFrame, edges: pd.DataFrame) -> pd.DataFrame:
-    """
-    Build a shared node table for handles and domains.
-
-    - Start from all unique node ids appearing in edges (sources + targets).
-    - Classify node_type: 'handle' if startswith '@', otherwise 'domain'.
-    - Join in aggregated stats from working table for authors and domains.
-    """
     if edges.empty:
         return pd.DataFrame(columns=[
             "id", "node_type", "num_posts", "total_engagement",
@@ -440,36 +396,24 @@ def build_node_table(working: pd.DataFrame, edges: pd.DataFrame) -> pd.DataFrame
 
     node_ids = pd.unique(edges[["source", "target"]].values.ravel("K"))
     nodes = pd.DataFrame({"id": node_ids})
-
-    nodes["node_type"] = nodes["id"].apply(
-        lambda x: "handle" if str(x).startswith("@") else "domain"
-    )
+    nodes["node_type"] = nodes["id"].apply(lambda x: "handle" if str(x).startswith("@") else "domain")
 
     author_stats = aggregate_author_stats(working)
     domain_stats = aggregate_domain_stats(working)
 
-    nodes = nodes.merge(author_stats, on="id", how="left", suffixes=("", "_author"))
+    nodes = nodes.merge(author_stats, on="id", how="left")
     nodes = nodes.merge(domain_stats, on="id", how="left", suffixes=("", "_domain"))
 
-    # Coalesce author & domain stats
-    for col in ["num_posts", "total_engagement", "total_reach",
-                "estimated_views", "language", "country"]:
-        col_author = col
-        col_domain = f"{col}_domain"
-        if col_author in nodes.columns and col_domain in nodes.columns:
-            nodes[col] = nodes[col_author].combine_first(nodes[col_domain])
-        elif col_domain in nodes.columns and col_author not in nodes.columns:
-            nodes[col] = nodes[col_domain]
+    for col in ["num_posts", "total_engagement", "total_reach", "estimated_views", "language", "country"]:
+        dom = f"{col}_domain"
+        if dom in nodes.columns:
+            nodes[col] = nodes[col].combine_first(nodes[dom])
 
-    keep_cols = [
-        "id", "node_type", "num_posts", "total_engagement",
-        "total_reach", "estimated_views", "language", "country"
-    ]
+    keep_cols = ["id", "node_type", "num_posts", "total_engagement", "total_reach", "estimated_views", "language", "country"]
     nodes = nodes[keep_cols]
 
     for col in ["num_posts", "total_engagement", "total_reach", "estimated_views"]:
-        if col in nodes.columns:
-            nodes[col] = pd.to_numeric(nodes[col], errors="coerce").fillna(0).astype(int)
+        nodes[col] = pd.to_numeric(nodes[col], errors="coerce").fillna(0).astype(int)
 
     return nodes
 
@@ -482,11 +426,11 @@ def main():
     st.title("Meltwater → Cosmograph Network Builder")
     st.write(
         """
-Upload one or more Meltwater exports (CSV/TSV).  
+Upload one or more Meltwater exports (CSV/TSV).
 This app will:
 - Load + combine files
-- Build a **directed edge list** (mentions + links)
-- Build a **node table** with handles & domains in one shared node set
+- Build a directed edge list (mentions + links)
+- Build a node table with handles & domains
 Then you can download both CSVs and load them into Cosmograph.
         """
     )
@@ -510,25 +454,38 @@ Then you can download both CSVs and load them into Cosmograph.
                 combined = load_and_combine_meltwater_streamlit(uploaded_files)
 
             if combined.empty:
-                st.warning("No data loaded. Check that your files are not empty.")
+                st.error(
+                    "No data loaded. The loader could not find a valid header row.\n\n"
+                    "This usually means the export's header line doesn't contain 'Date', 'Time', and 'Author Handle' "
+                    "as expected, or the file is not a Meltwater export."
+                )
                 return
+
+            st.write("Loaded rows:", len(combined))
+            st.write("Loaded columns:", list(combined.columns))
 
             with st.spinner("Reducing to working schema..."):
                 working = get_working_table(combined)
 
-            st.write("Loaded rows:", len(combined))
-            st.write("Loaded columns:", list(combined.columns))
             st.write("Working rows:", len(working))
             st.write("Working columns:", list(working.columns))
+
+            if working.empty or "Author Handle" not in working.columns:
+                st.error(
+                    "Working table is empty or missing 'Author Handle'.\n\n"
+                    "Your file is loading, but its headers do not match the expected Meltwater schema. "
+                    "Scroll up to see 'Loaded columns' and compare them to the required names."
+                )
+                return
 
             with st.spinner("Building edge list..."):
                 edges = build_edge_list(working)
 
             if edges.empty:
                 st.warning(
-                    "No edges found. Confirm your export includes 'Author Handle' and either:\n"
-                    "- Opening Text / Hit Sentence with @handles, and/or\n"
-                    "- Links with URLs"
+                    "No edges found. Confirm your export includes:\n"
+                    "- 'Author Handle' AND\n"
+                    "- either 'Opening Text'/'Hit Sentence' with @handles OR 'Links' with URLs."
                 )
                 return
 
@@ -552,6 +509,7 @@ Then you can download both CSVs and load them into Cosmograph.
                 file_name="edges.csv",
                 mime="text/csv",
             )
+
             st.download_button(
                 label="Download node table CSV",
                 data=nodes_csv,
