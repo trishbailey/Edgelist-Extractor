@@ -83,34 +83,68 @@ def load_and_combine_meltwater_streamlit(uploaded_files) -> pd.DataFrame:
 
 
 # -----------------------------
-# UTILITIES: NORMALIZATION / WORKING SCHEMA
+# UTILITIES: LOADING MELTWATER EXPORTS (ROBUST)
 # -----------------------------
+import csv
+import pandas as pd
 
-def normalize_author_handle(series: pd.Series) -> pd.Series:
+def load_and_clean_meltwater_file(file_like) -> pd.DataFrame:
     """
-    Ensure handles have a leading '@' and are trimmed of whitespace.
+    Robust reader for Meltwater exports that often contain:
+      - inconsistent field counts
+      - broken/unbalanced quotes
+      - mixed delimiters (TSV is common)
+      - a junk first line before the real header
+
+    Strategy:
+      1) Read as raw text, drop the first line (junk/query line)
+      2) Try TSV with QUOTE_NONE (treat quotes as literal)
+      3) Fallback to comma CSV with same settings
+      4) Force strings; never let pandas infer types
+      5) Skip malformed rows deterministically
     """
-    s = series.astype(str).str.strip()
-    s = "@" + s.str.lstrip("@")
-    return s
 
+    # Streamlit UploadedFile is a buffer; ensure we're at the start
+    try:
+        file_like.seek(0)
+    except Exception:
+        pass
 
-def get_working_table(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    From a full Meltwater table, select only the columns we care about.
-    Columns missing from a particular file are simply ignored.
-    """
-    if df.empty:
-        return df
+    raw = file_like.read()
+    if isinstance(raw, bytes):
+        # latin1 is permissive; keeps byte values 0-255 without decode errors
+        text = raw.decode("latin1", errors="replace")
+    else:
+        text = str(raw)
 
-    available_cols = [c for c in WORKING_COLUMNS if c in df.columns]
-    working = df[available_cols].copy()
+    # Drop the first line (Meltwater often includes a query/junk line)
+    lines = text.splitlines()
+    if len(lines) >= 2:
+        text = "\n".join(lines[1:])
 
-    # Normalize Author Handle if present
-    if "Author Handle" in working.columns:
-        working["Author Handle"] = normalize_author_handle(working["Author Handle"])
+    # Helper to parse from in-memory text
+    from io import StringIO
 
-    return working
+    def _read_with_sep(sep: str) -> pd.DataFrame:
+        return pd.read_csv(
+            StringIO(text),
+            sep=sep,
+            engine="python",
+            dtype=str,
+            keep_default_na=False,
+            on_bad_lines="skip",       # deterministic: skip malformed rows
+            quoting=csv.QUOTE_NONE,    # critical: don't parse quotes at all
+        )
+
+    # Try TSV first, then comma CSV
+    try:
+        df = _read_with_sep("\t")
+    except Exception:
+        df = _read_with_sep(",")
+
+    # Clean column names
+    df.columns = df.columns.astype(str).str.strip()
+    return df
 
 
 # -----------------------------
