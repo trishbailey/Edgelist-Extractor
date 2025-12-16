@@ -11,6 +11,7 @@ import streamlit as st
 # -----------------------------
 
 WORKING_COLUMNS = [
+    # For edges
     "Date",
     "Time",
     "Author Handle",
@@ -18,8 +19,9 @@ WORKING_COLUMNS = [
     "Hit Sentence",
     "Links",
     "Source Domain",
+    # For node enrichment
     "Language",
-    "Country",
+    "Country",          # optional; ignored if missing
     "Engagement",
     "Reach",
     "Estimated Views",
@@ -28,20 +30,16 @@ WORKING_COLUMNS = [
     "Document Tags",
 ]
 
-# Columns we need to build edges
-REQUIRED_EDGE_COLUMNS = {"Author Handle"}
-TEXT_EDGE_COLUMNS = {"Opening Text", "Hit Sentence"}
-LINK_EDGE_COLUMNS = {"Links"}
-
 HANDLE_REGEX = r"(@[A-Za-z0-9_]+)"
 X_DOMAINS = {"x.com", "twitter.com", "mobile.twitter.com"}
 
 
 # -----------------------------
-# UTILITIES: LOADING MELTWATER EXPORTS (ROBUST + HEADER DETECTION)
+# UTILITIES: FILE DECODE + HEADER-PREAMBLE HANDLING
 # -----------------------------
 
 def _decode_uploaded_file(file_like) -> str:
+    """Decode Streamlit UploadedFile into text without hard failures."""
     try:
         file_like.seek(0)
     except Exception:
@@ -53,52 +51,81 @@ def _decode_uploaded_file(file_like) -> str:
     return str(raw)
 
 
-def _find_header_line_index(lines) -> int | None:
-    """
-    Find the line index that looks like the real Meltwater header.
-    We look for a line containing several expected column names.
-    """
-    # Be tolerant: check lowercase, and allow either comma or tab separated header lines.
-    header_markers = [
-        "date",
-        "time",
-        "author handle",
-    ]
-    # Search first ~50 lines (more than enough for Meltwater preamble)
-    max_scan = min(len(lines), 80)
-    for i in range(max_scan):
-        hay = lines[i].strip().lower()
-        if not hay:
-            continue
-        # Must contain all core markers
-        if all(m in hay for m in header_markers):
-            return i
-    return None
+def _strip_leading_empty_lines(lines: list[str]) -> list[str]:
+    i = 0
+    while i < len(lines) and not lines[i].strip():
+        i += 1
+    return lines[i:]
 
+
+def _drop_meltwater_query_line(lines: list[str]) -> list[str]:
+    """
+    Your Meltwater export pattern:
+      - line 1: query/title only (1 field; few or no delimiters)
+      - line 2: real header (46 fields; many delimiters)
+    We drop the first line if it doesn't look like a header row.
+    """
+    lines = _strip_leading_empty_lines(lines)
+    if len(lines) < 2:
+        return lines
+
+    first = lines[0]
+    second = lines[1]
+
+    # Count delimiters to infer if line is a real table row/header or a single-cell title.
+    # Header line will have many commas or tabs.
+    first_commas = first.count(",")
+    first_tabs = first.count("\t")
+    second_commas = second.count(",")
+    second_tabs = second.count("\t")
+
+    first_delims = max(first_commas, first_tabs)
+    second_delims = max(second_commas, second_tabs)
+
+    # If first line has very few delimiters but second has many, drop the first.
+    if first_delims <= 2 and second_delims >= 10:
+        return lines[1:]
+
+    return lines
+
+
+def _choose_sep_from_header(header_line: str) -> str:
+    """Pick delimiter based on header line."""
+    if header_line.count("\t") > header_line.count(","):
+        return "\t"
+    return ","
+
+
+# -----------------------------
+# UTILITIES: LOADING MELTWATER EXPORTS (ROBUST)
+# -----------------------------
 
 def load_and_clean_meltwater_file(file_like) -> pd.DataFrame:
     """
-    Robust reader that:
-      1) decodes raw text
-      2) finds the true header row by scanning for 'Date', 'Time', 'Author Handle'
-      3) reads from that header row onward
-      4) tries TSV first, then CSV
-      5) treats quotes literally and skips malformed lines
+    Robust loader for your Meltwater export:
+      - Drops the first single-cell query/title line
+      - Uses the true header row
+      - Tries TSV/CSV
+      - Skips malformed rows and treats quotes as literal
     """
     text = _decode_uploaded_file(file_like)
     lines = text.splitlines()
+    lines = _drop_meltwater_query_line(lines)
 
-    header_idx = _find_header_line_index(lines)
-    if header_idx is None:
-        # Could not find a header line; return empty with a helpful signal
+    if not lines:
         return pd.DataFrame()
 
-    # Rebuild text starting at the header row
-    trimmed_text = "\n".join(lines[header_idx:])
+    # Now line 0 should be the real header row
+    header_line = lines[0]
+    body_text = "\n".join(lines)
 
-    def _read_with_sep(sep: str) -> pd.DataFrame:
+    # Choose primary separator based on header line
+    primary_sep = _choose_sep_from_header(header_line)
+    fallback_sep = "," if primary_sep == "\t" else "\t"
+
+    def _read(sep: str) -> pd.DataFrame:
         return pd.read_csv(
-            StringIO(trimmed_text),
+            StringIO(body_text),
             sep=sep,
             header=0,
             engine="python",
@@ -108,16 +135,17 @@ def load_and_clean_meltwater_file(file_like) -> pd.DataFrame:
             quoting=csv.QUOTE_NONE,
         )
 
-    # Try TSV then CSV
     try:
-        df = _read_with_sep("\t")
-        # If it parsed as 1 column, delimiter probably isn't tab
+        df = _read(primary_sep)
+        # If it collapsed into 1 column, the separator guess was wrong
         if df.shape[1] <= 1:
-            df = _read_with_sep(",")
+            df = _read(fallback_sep)
     except Exception:
-        df = _read_with_sep(",")
+        try:
+            df = _read(fallback_sep)
+        except Exception:
+            return pd.DataFrame()
 
-    # Clean column names
     df.columns = df.columns.astype(str).str.strip()
     return df
 
@@ -141,11 +169,15 @@ def load_and_combine_meltwater_streamlit(uploaded_files) -> pd.DataFrame:
 
 def normalize_author_handle(series: pd.Series) -> pd.Series:
     s = series.fillna("").astype(str).str.strip()
+    # Meltwater sometimes exports without '@' (rare), so enforce it safely
     s = s.apply(lambda x: x if (x == "" or x.startswith("@")) else f"@{x}")
     return s
 
 
 def get_working_table(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Reduce raw Meltwater table to the working schema your edge/node code expects.
+    """
     if df is None or df.empty:
         return pd.DataFrame()
 
@@ -235,6 +267,7 @@ def parse_links_cell(links_value) -> set:
     parts = [p for p in parts if p]
 
     for url in parts:
+        # Add scheme if missing so urlparse can populate netloc
         if not re.match(r"^https?://", url, flags=re.I):
             url = "https://" + url
 
@@ -295,15 +328,12 @@ def build_edge_list(working: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame(columns=["source", "target", "edge_type", "weight"])
 
     edges["weight"] = 1
-    edges = (
-        edges.groupby(["source", "target", "edge_type"], as_index=False)["weight"]
-        .sum()
-    )
+    edges = edges.groupby(["source", "target", "edge_type"], as_index=False)["weight"].sum()
     return edges
 
 
 # -----------------------------
-# NODE TABLE
+# NODE TABLE (SHARED HANDLE + DOMAIN SET)
 # -----------------------------
 
 def aggregate_author_stats(working: pd.DataFrame) -> pd.DataFrame:
@@ -333,14 +363,8 @@ def aggregate_author_stats(working: pd.DataFrame) -> pd.DataFrame:
         m = s.mode(dropna=True)
         return m.iloc[0] if not m.empty else pd.NA
 
-    language = (
-        grouped["Language"].apply(mode_or_nan).rename("language")
-        if "Language" in df.columns else pd.Series(dtype="object")
-    )
-    country = (
-        grouped["Country"].apply(mode_or_nan).rename("country")
-        if "Country" in df.columns else pd.Series(dtype="object")
-    )
+    language = grouped["Language"].apply(mode_or_nan).rename("language") if "Language" in df.columns else pd.Series(dtype="object")
+    country = grouped["Country"].apply(mode_or_nan).rename("country") if "Country" in df.columns else pd.Series(dtype="object")
 
     stats = pd.concat([num_posts, total_eng, total_reach, est_views, language, country], axis=1).reset_index()
     return stats.rename(columns={"Author Handle": "id"})
@@ -374,14 +398,8 @@ def aggregate_domain_stats(working: pd.DataFrame) -> pd.DataFrame:
         m = s.mode(dropna=True)
         return m.iloc[0] if not m.empty else pd.NA
 
-    language = (
-        grouped["Language"].apply(mode_or_nan).rename("language")
-        if "Language" in df.columns else pd.Series(dtype="object")
-    )
-    country = (
-        grouped["Country"].apply(mode_or_nan).rename("country")
-        if "Country" in df.columns else pd.Series(dtype="object")
-    )
+    language = grouped["Language"].apply(mode_or_nan).rename("language") if "Language" in df.columns else pd.Series(dtype="object")
+    country = grouped["Country"].apply(mode_or_nan).rename("country") if "Country" in df.columns else pd.Series(dtype="object")
 
     stats = pd.concat([num_posts, total_eng, total_reach, est_views, language, country], axis=1).reset_index()
     return stats.rename(columns={"Source Domain": "id"})
@@ -426,11 +444,11 @@ def main():
     st.title("Meltwater → Cosmograph Network Builder")
     st.write(
         """
-Upload one or more Meltwater exports (CSV/TSV).
+Upload one or more Meltwater exports (CSV/TSV).  
 This app will:
 - Load + combine files
-- Build a directed edge list (mentions + links)
-- Build a node table with handles & domains
+- Build a **directed edge list** (mentions + links)
+- Build a **node table** with handles & domains in one shared node set  
 Then you can download both CSVs and load them into Cosmograph.
         """
     )
@@ -455,9 +473,9 @@ Then you can download both CSVs and load them into Cosmograph.
 
             if combined.empty:
                 st.error(
-                    "No data loaded. The loader could not find a valid header row.\n\n"
-                    "This usually means the export's header line doesn't contain 'Date', 'Time', and 'Author Handle' "
-                    "as expected, or the file is not a Meltwater export."
+                    "No data loaded.\n\n"
+                    "This usually means the file isn't being parsed as a delimited table, "
+                    "or the header/preamble format differs from the standard Meltwater export."
                 )
                 return
 
@@ -473,8 +491,7 @@ Then you can download both CSVs and load them into Cosmograph.
             if working.empty or "Author Handle" not in working.columns:
                 st.error(
                     "Working table is empty or missing 'Author Handle'.\n\n"
-                    "Your file is loading, but its headers do not match the expected Meltwater schema. "
-                    "Scroll up to see 'Loaded columns' and compare them to the required names."
+                    "Your export loaded, but required Meltwater columns were not found."
                 )
                 return
 
@@ -509,7 +526,6 @@ Then you can download both CSVs and load them into Cosmograph.
                 file_name="edges.csv",
                 mime="text/csv",
             )
-
             st.download_button(
                 label="Download node table CSV",
                 data=nodes_csv,
