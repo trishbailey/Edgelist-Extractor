@@ -1,3 +1,4 @@
+Output
 """
 Meltwater → Cosmograph Network Builder
 =======================================
@@ -94,19 +95,36 @@ def load_meltwater_file(file_like) -> pd.DataFrame:
     Strategy:
     1. Read raw bytes and decode with multiple encoding attempts
     2. Find the actual header row by looking for known column names
-    3. Parse with explicit comma delimiter (Meltwater uses comma-separated)
+    3. Parse with explicit delimiter (tab for UTF-16, comma for others)
     4. Clean column names
     """
     # Read raw bytes
     raw_bytes = file_like.read()
     file_like.seek(0)  # Reset for potential re-read
     
-    # Try multiple encodings
+    # Detect UTF-16 by looking for BOM or null bytes pattern
+    is_utf16 = False
+    if raw_bytes.startswith(b'\xff\xfe') or raw_bytes.startswith(b'\xfe\xff'):
+        is_utf16 = True
+    elif b'\x00' in raw_bytes[:100]:
+        # Null bytes in first 100 bytes strongly suggests UTF-16
+        is_utf16 = True
+    
+    # Try multiple encodings, prioritizing UTF-16 if detected
     content = None
-    for encoding in ['utf-8-sig', 'utf-8', 'latin1', 'cp1252']:
+    if is_utf16:
+        encodings = ['utf-16', 'utf-16-le', 'utf-16-be', 'utf-8-sig', 'utf-8', 'latin1', 'cp1252']
+    else:
+        encodings = ['utf-8-sig', 'utf-8', 'latin1', 'cp1252', 'utf-16', 'utf-16-le']
+    
+    for encoding in encodings:
         try:
             content = raw_bytes.decode(encoding)
-            break
+            # Verify we got readable content (not garbage)
+            if '\x00' not in content[:200]:  # No null bytes in decoded content
+                break
+            else:
+                content = None  # Reset and try next encoding
         except (UnicodeDecodeError, LookupError):
             continue
     
@@ -118,14 +136,21 @@ def load_meltwater_file(file_like) -> pd.DataFrame:
     lines = content.split('\n')
     header_row_idx = find_header_row(lines)
     
+    # Detect delimiter: tab or comma
+    # Check the header row for tabs vs commas
+    header_line = lines[header_row_idx] if header_row_idx < len(lines) else ""
+    tab_count = header_line.count('\t')
+    comma_count = header_line.count(',')
+    delimiter = '\t' if tab_count > comma_count else ','
+    
     # Parse CSV from string
     try:
         df = pd.read_csv(
             StringIO(content),
-            sep=',',                    # Meltwater uses comma delimiter
+            sep=delimiter,              # Auto-detected delimiter
             header=header_row_idx,      # Dynamic header row detection
             on_bad_lines='skip',        # Skip malformed lines
-            quoting=1,                  # QUOTE_ALL - handles embedded commas
+            quoting=1,                  # QUOTE_ALL - handles embedded delimiters
             dtype=str,                  # Read everything as string initially
             low_memory=False
         )
@@ -134,7 +159,7 @@ def load_meltwater_file(file_like) -> pd.DataFrame:
         # Fallback: try with python engine
         df = pd.read_csv(
             StringIO(content),
-            sep=',',
+            sep=delimiter,
             header=header_row_idx,
             on_bad_lines='skip',
             engine='python',
