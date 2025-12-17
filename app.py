@@ -1,4 +1,3 @@
-Output
 """
 Meltwater → Cosmograph Network Builder
 =======================================
